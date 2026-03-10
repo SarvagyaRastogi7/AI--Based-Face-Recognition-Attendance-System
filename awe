@@ -1,41 +1,155 @@
-from functools import lru_cache
-import os
-from dataclasses import dataclass
-from typing import Optional
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Client Briefing Generator</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Arial, sans-serif;
+        background: #f5f7fb;
+        margin: 0;
+        padding: 0;
+      }
 
+      .wrapper {
+        max-width: 720px;
+        margin: 60px auto;
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
+        padding: 32px 40px 36px;
+      }
 
-@dataclass
-class Settings:
-    """
-    Minimal settings loader using plain environment variables.
-    No pydantic dependency needed, so this works with any version.
-    """
+      h1 {
+        margin-top: 0;
+        font-size: 24px;
+        color: #111827;
+      }
 
-    # General
-    app_name: str = "RAG Briefing Generator"
+      p.description {
+        margin-top: 4px;
+        margin-bottom: 20px;
+        color: #4b5563;
+        font-size: 14px;
+      }
 
-    # Azure OpenAI / Azure Models via openai SDK
-    azure_openai_endpoint: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_openai_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
-    azure_openai_deployment: Optional[str] = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    azure_openai_api_version: str = os.getenv(
-        "AZURE_OPENAI_API_VERSION", "2024-10-21"
-    )
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        color: #374151;
+        margin-bottom: 4px;
+      }
 
-    # Database (Oracle or other)
-    db_dsn: Optional[str] = os.getenv("DB_DSN")
-    db_user: Optional[str] = os.getenv("DB_USER")
-    db_password: Optional[str] = os.getenv("DB_PASSWORD")
-    db_host: Optional[str] = os.getenv("DB_HOST")
-    db_port: int = int(os.getenv("DB_PORT", "1521"))
-    db_service: Optional[str] = os.getenv("DB_SERVICE")
+      input[type="text"],
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 8px;
+        border: 1px solid #d1d5db;
+        padding: 10px 12px;
+        font-size: 14px;
+        font-family: inherit;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      }
 
-    # Web search
-    search_api_key: Optional[str] = os.getenv("SEARCH_API_KEY")
-    search_endpoint: Optional[str] = os.getenv("SEARCH_ENDPOINT")
+      input[type="text"]:focus,
+      textarea:focus {
+        outline: none;
+        border-color: #2563eb;
+        box-shadow: 0 0 0 1px #2563eb33;
+      }
 
+      textarea {
+        min-height: 80px;
+        resize: vertical;
+      }
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    return Settings()
+      .field {
+        margin-bottom: 18px;
+      }
+
+      button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 10px 18px;
+        border-radius: 999px;
+        border: none;
+        background: linear-gradient(135deg, #2563eb, #1d4ed8);
+        color: #ffffff;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 8px 18px rgba(37, 99, 235, 0.35);
+        transition: transform 0.08s ease, box-shadow 0.08s ease,
+          filter 0.08s ease;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 10px 22px rgba(37, 99, 235, 0.42);
+        filter: brightness(1.02);
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+        box-shadow: none;
+        transform: none;
+      }
+
+      .status {
+        margin-top: 12px;
+        font-size: 13px;
+      }
+
+      .status.error {
+        color: #b91c1c;
+      }
+
+      .status.success {
+        color: #166534;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <h1>Client Briefing Generator</h1>
+      <p class="description">
+        Enter the client name (matching <code>CUSTOMER_NAME</code> in your
+        SmartInsights tables) and the meeting context. The system will generate
+        a Crisil-style briefing page using your Oracle data, optional web
+        search, and your Azure LLM.
+      </p>
+
+      <form id="briefing-form" method="post" action="/generate-briefing">
+        <div class="field">
+          <label for="company_name">Client name</label>
+          <input
+            type="text"
+            id="company_name"
+            name="company_name"
+            placeholder="ACME INDUSTRIES LTD"
+            required
+          />
+        </div>
+
+        <div class="field">
+          <label for="meeting_context">Meeting context (optional)</label>
+          <textarea
+            id="meeting_context"
+            name="meeting_context"
+            placeholder="Briefing for upcoming meeting with CFO on FY26 strategy and capex plans."
+          ></textarea>
+        </div>
+
+        <button type="submit" id="submit-btn">
+          Generate HTML briefing
+        </button>
+      </form>
+    </div>
+  </body>
+</html>
 
