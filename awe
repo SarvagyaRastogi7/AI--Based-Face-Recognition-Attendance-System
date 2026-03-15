@@ -1,184 +1,213 @@
 """
-Builds briefing sections using RMDB section_data and optional web_docs.
-Each section uses the tables that make sense for that part of the summary.
+Oracle service wired to Corporate Relationship Manager Dashboard (RMDB) tables.
+
+Tables used:
+- MV_DIM_LH_CUST_IB_GKAP: central customer (lookup by name; feeds Background, Client Overview)
+- MV_USER_ACCESS: user roles per customer (Standard Information)
+- DIM_LH_IB_GKAP_REPORT: KAP reports (Standard Information)
+- FCT_LH_IB_GKAP_WALLET_DETAILS: wallet sizes / values (Standard Information, Client Overview)
+- FCT_LH_IB_GKAP_FINANCIAL_RATIO: financial ratios (Strategic Initiatives, Client Overview)
+- FCT_LH_IB_GKAP_ISSUE_CONSTRAINT: issues/constraints (Engagement, Strategic)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from app.clients.azure_llm import AzureLLMClient
+import oracledb
+
+from app.config import get_settings
 
 
-@dataclass
-class ReportSections:
-    executive_summary: str
-    prospect_background: str
-    standard_information: str
-    engagement_opportunities: str
-    strategic_initiatives: str
-    client_overview: str
-    recent_news: str
-
-    def to_dict(self) -> Dict[str, str]:
-        return {
-            "executive_summary": self.executive_summary,
-            "prospect_background": self.prospect_background,
-            "standard_information": self.standard_information,
-            "engagement_opportunities": self.engagement_opportunities,
-            "strategic_initiatives": self.strategic_initiatives,
-            "client_overview": self.client_overview,
-            "recent_news": self.recent_news,
-        }
+def _row_to_dict(cur: Any, row: tuple) -> Dict[str, Any]:
+    if not row:
+        return {}
+    columns = [desc[0].lower() for desc in cur.description]
+    return dict(zip(columns, row))
 
 
-def _format_for_llm(label: str, data: Any) -> str:
-    if data is None:
-        return f"{label}: (none)"
-    if isinstance(data, (list, tuple)):
-        if not data:
-            return f"{label}: (empty)"
-        lines = [str(item) for item in data]
-        return f"{label}:\n" + "\n".join(lines)
-    return f"{label}:\n{data}"
-
-
-class BriefingOrchestrator:
+class OracleService:
     """
-    Orchestrates section-wise LLM calls using RMDB section_data and web search.
+    Fetches data from RMDB tables. Lookup by CUSTOMER_NAME in MV_DIM_LH_CUST_IB_GKAP;
+    other tables joined via CUSTOMER_NUMBER / CUSTOMER_ID.
     """
 
     def __init__(self) -> None:
-        self._llm = AzureLLMClient()
+        self._settings = get_settings()
 
-    def _join_web_docs(self, web_docs: List[Dict[str, Any]]) -> str:
-        if not web_docs:
-            return "(No web search results available.)"
-        lines: List[str] = []
-        for doc in web_docs:
-            line = f"- {doc.get('title', 'Untitled')} ({doc.get('date', 'unknown date')}): {doc.get('summary', '')}"
-            lines.append(line)
-        return "\n".join(lines)
-
-    def build_report_sections(
-        self,
-        *,
-        company_name: str,
-        meeting_context: str | None,
-        section_data: Dict[str, Any],
-        web_docs: List[Dict[str, Any]],
-    ) -> ReportSections:
-        profile = section_data.get("client_profile") or {}
-        user_access = section_data.get("user_access") or []
-        kap_reports = section_data.get("kap_reports") or []
-        wallet_details = section_data.get("wallet_details") or []
-        financial_ratios = section_data.get("financial_ratios") or []
-        issues_constraints = section_data.get("issues_constraints") or []
-
-        web_text = f"WEB SEARCH SNIPPETS:\n{self._join_web_docs(web_docs)}"
-
-        # ---- Executive Summary: profile + wallet/ratios high-level + web ----
-        exec_context = (
-            f"CLIENT PROFILE (MV_DIM_LH_CUST_IB_GKAP):\n{profile}\n\n"
-            f"WALLET SUMMARY (sample):\n{_format_for_llm('wallet_details', wallet_details[:5])}\n\n"
-            f"FINANCIAL RATIOS (sample):\n{_format_for_llm('financial_ratios', financial_ratios[:10])}\n\n"
-            f"{web_text}"
-        )
-        exec_summary_prompt = (
-            f"Generate a 2–3 paragraph executive summary for a client briefing on {company_name}.\n"
-            f"Meeting context: {meeting_context or 'not specified'}.\n"
-            "Focus on overall positioning, relationship context, and key considerations for senior management."
-        )
-        executive_summary = self._llm.generate(
-            prompt=f"{exec_context}\n\nTASK:\n{exec_summary_prompt}"
+    def _connect(self) -> oracledb.Connection:
+        if self._settings.db_dsn:
+            dsn = self._settings.db_dsn
+        else:
+            if not (
+                self._settings.db_host
+                and self._settings.db_service
+                and self._settings.db_user
+            ):
+                raise RuntimeError(
+                    "Database settings missing. Set DB_DSN or "
+                    "DB_HOST, DB_SERVICE, DB_USER (and DB_PORT, DB_PASSWORD)."
+                )
+            dsn = oracledb.makedsn(
+                self._settings.db_host,
+                int(self._settings.db_port or 1521),
+                service_name=self._settings.db_service,
+            )
+        return oracledb.connect(
+            user=self._settings.db_user,
+            password=self._settings.db_password,
+            dsn=dsn,
         )
 
-        # ---- Background of the Prospect: central customer table only ----
-        prospect_context = f"CLIENT PROFILE (customer details, RM, segment, group):\n{profile}"
-        prospect_prompt = (
-            "Write a concise 'Background of the Prospect' section summarizing "
-            "customer identity, segment, group, relationship manager, and key stakeholder/visibility."
-        )
-        prospect_background = self._llm.generate(
-            prompt=f"{prospect_context}\n\nTASK:\n{prospect_prompt}"
-        )
+    def get_client_profile(self, company_name: str) -> Dict[str, Any]:
+        """
+        Fetch one customer from MV_DIM_LH_CUST_IB_GKAP by CUSTOMER_NAME.
+        Used for: Background of the Prospect, Client Overview, and as key for other tables.
+        """
+        query = """
+            SELECT
+                MDM_ID,
+                CUSTOMER_NUMBER,
+                CUSTOMER_UID,
+                CUSTOMER_NAME,
+                CODED_CUSTOMER_NAME,
+                RM_EMP_ID,
+                RM_NAME,
+                RM_TYPE,
+                RM_LOCATION,
+                CUSTOMER_SEGMENT,
+                CUSTOMER_SUB_SEGMENT,
+                CUST_CATEGORY,
+                GROUP_NAME,
+                GROUP_ID,
+                GROUP_KEY,
+                CUSTOMER_STATUS,
+                CUSTOMER_VISIBLE_FLAG,
+                CUSTOMER_CREATION_DATE,
+                LOAD_DATE,
+                FROM_DATE,
+                TO_DATE
+            FROM MV_DIM_LH_CUST_IB_GKAP
+            WHERE UPPER(TRIM(CUSTOMER_NAME)) = UPPER(TRIM(:name))
+            AND (CUSTOMER_VISIBLE_FLAG = 1 OR CUSTOMER_VISIBLE_FLAG IS NULL)
+            AND ROWNUM = 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, {"name": company_name})
+                row = cur.fetchone()
+                return _row_to_dict(cur, row) if row else {}
 
-        # ---- Standard Information from Businesses: user access, KAP reports, wallet ----
-        standard_context = (
-            f"USER ACCESS (roles):\n{_format_for_llm('user_access', user_access)}\n\n"
-            f"KAP REPORTS:\n{_format_for_llm('kap_reports', kap_reports)}\n\n"
-            f"WALLET DETAILS:\n{_format_for_llm('wallet_details', wallet_details)}"
-        )
-        standard_prompt = (
-            "Using the structured business information above, summarise the existing relationship, "
-            "key products/wallet, relationship vintage, and exposure profile. "
-            "Keep it factual and organized in short paragraphs or bullet points."
-        )
-        standard_information = self._llm.generate(
-            prompt=f"{standard_context}\n\nTASK:\n{standard_prompt}"
-        )
+    def get_user_access(self, customer_number: str) -> List[Dict[str, Any]]:
+        """MV_USER_ACCESS: roles and access for this customer. For Standard Information."""
+        query = """
+            SELECT FGB_ID, CUSTOMER_NUMBER, ROLE, BANKING_TYPE_CUST
+            FROM MV_USER_ACCESS
+            WHERE CUSTOMER_NUMBER = :customer_number
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, {"customer_number": customer_number})
+                rows = cur.fetchall()
+                return [_row_to_dict(cur, row) for row in rows]
 
-        # ---- Potential Areas of Engagement: issues/constraints + segment + profile ----
-        engagement_context = (
-            f"CLIENT PROFILE (segment, group, category):\n{profile}\n\n"
-            f"ISSUES / CONSTRAINTS (from KAP):\n{_format_for_llm('issues_constraints', issues_constraints)}\n\n"
-            f"{web_text}"
-        )
-        engagement_prompt = (
-            "Based on the client profile, issues/constraints, and any recent news, "
-            "suggest potential areas of engagement and specific talk points for a relationship meeting."
-        )
-        engagement_opportunities = self._llm.generate(
-            prompt=f"{engagement_context}\n\nTASK:\n{engagement_prompt}"
-        )
+    def get_kap_reports(self, customer_id: str) -> List[Dict[str, Any]]:
+        """DIM_LH_IB_GKAP_REPORT: KAP reports for this customer. For Standard Information."""
+        query = """
+            SELECT KAP_REPORT_ID, CUSTOMER_ID, GROUP_ORR, BANKING_TYPE
+            FROM DIM_LH_IB_GKAP_REPORT
+            WHERE CUSTOMER_ID = :customer_id
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, {"customer_id": customer_id})
+                rows = cur.fetchall()
+                return [_row_to_dict(cur, row) for row in rows]
 
-        # ---- Strategic Initiatives: financial ratios + issues/constraints + web ----
-        strategic_context = (
-            f"FINANCIAL RATIOS (trends PY4 to CY):\n{_format_for_llm('financial_ratios', financial_ratios)}\n\n"
-            f"ISSUES / CONSTRAINTS:\n{_format_for_llm('issues_constraints', issues_constraints)}\n\n"
-            f"{web_text}"
-        )
-        strategic_prompt = (
-            "Summarise the client's strategic initiatives and focus areas from financial trends, "
-            "reported issues/constraints, and recent news (e.g. capex, digital, ESG, M&A). "
-            "Structure as short paragraphs or bullet points."
-        )
-        strategic_initiatives = self._llm.generate(
-            prompt=f"{strategic_context}\n\nTASK:\n{strategic_prompt}"
-        )
+    def get_wallet_details(self, customer_id: str) -> List[Dict[str, Any]]:
+        """FCT_LH_IB_GKAP_WALLET_DETAILS: wallet sizes and values. For Standard Information, Client Overview."""
+        query = """
+            SELECT
+                KAP_REPORT_ID,
+                CUSTOMER_ID,
+                BANKING_TYPE,
+                CLIENT_WALLET_SIZE,
+                CLIENT_WALLET_SIZE_NRM,
+                CLIENT_WALLET_SIZE_GRM,
+                VALUE_PY2,
+                VALUE_PY1,
+                VALUE_CY
+            FROM FCT_LH_IB_GKAP_WALLET_DETAILS
+            WHERE CUSTOMER_ID = :customer_id
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, {"customer_id": customer_id})
+                rows = cur.fetchall()
+                return [_row_to_dict(cur, row) for row in rows]
 
-        # ---- Client Overview: profile + wallet + ratios + web ----
-        overview_context = (
-            f"CLIENT PROFILE:\n{profile}\n\n"
-            f"WALLET DETAILS:\n{_format_for_llm('wallet_details', wallet_details)}\n\n"
-            f"FINANCIAL RATIOS:\n{_format_for_llm('financial_ratios', financial_ratios)}\n\n"
-            f"{web_text}"
-        )
-        overview_prompt = (
-            "Draft a 'Client Overview' section that blends structured database information and "
-            "publicly available information. Prioritise the structured data; mention material public facts."
-        )
-        client_overview = self._llm.generate(
-            prompt=f"{overview_context}\n\nTASK:\n{overview_prompt}"
-        )
+    def get_financial_ratios(self, customer_id: str) -> List[Dict[str, Any]]:
+        """FCT_LH_IB_GKAP_FINANCIAL_RATIO: ratios and trends. For Strategic Initiatives, Client Overview."""
+        query = """
+            SELECT
+                KAP_REPORT_ID,
+                CUSTOMER_ID,
+                KPI_DESCRIPTION,
+                VALUE_PY4,
+                VALUE_PY3,
+                VALUE_PY2,
+                VALUE_PY1,
+                VALUE_CY
+            FROM FCT_LH_IB_GKAP_FINANCIAL_RATIO
+            WHERE CUSTOMER_ID = :customer_id
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, {"customer_id": customer_id})
+                rows = cur.fetchall()
+                return [_row_to_dict(cur, row) for row in rows]
 
-        # ---- Recent and Relevant News: web only ----
-        news_prompt = (
-            "List the most recent and relevant news items about the client as bullet points. "
-            "For each item, include date (if known), a one-line summary, and source or URL if available. "
-            "If no web results are provided, say so briefly."
-        )
-        recent_news = self._llm.generate(
-            prompt=f"{web_text}\n\nTASK:\n{news_prompt}"
-        )
+    def get_issues_constraints(self, customer_id: str) -> List[Dict[str, Any]]:
+        """FCT_LH_IB_GKAP_ISSUE_CONSTRAINT: issues/constraints. For Engagement, Strategic Initiatives."""
+        query = """
+            SELECT KAP_REPORT_ID, CUSTOMER_ID, ISSUE_CONSTRAINT_TYPE, DESCRIPTION, STATUS
+            FROM FCT_LH_IB_GKAP_ISSUE_CONSTRAINT
+            WHERE CUSTOMER_ID = :customer_id
+        """
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, {"customer_id": customer_id})
+                    rows = cur.fetchall()
+                    return [_row_to_dict(cur, row) for row in rows]
+        except oracledb.Error:
+            # Column names may differ; return empty if table/columns not present
+            return []
 
-        return ReportSections(
-            executive_summary=executive_summary,
-            prospect_background=prospect_background,
-            standard_information=standard_information,
-            engagement_opportunities=engagement_opportunities,
-            strategic_initiatives=strategic_initiatives,
-            client_overview=client_overview,
-            recent_news=recent_news,
-        )
+    def get_section_data(self, company_name: str) -> Dict[str, Any]:
+        """
+        Single entry point: fetch profile by company name, then all RMDB data
+        needed for each briefing section. Returns a dict with:
+        - client_profile: from MV_DIM_LH_CUST_IB_GKAP (Background, Client Overview)
+        - user_access: Standard Information
+        - kap_reports: Standard Information
+        - wallet_details: Standard Information, Client Overview
+        - financial_ratios: Strategic Initiatives, Client Overview
+        - issues_constraints: Engagement, Strategic Initiatives
+        """
+        profile = self.get_client_profile(company_name)
+        if not profile:
+            return {"client_profile": {}, "user_access": [], "kap_reports": [], "wallet_details": [], "financial_ratios": [], "issues_constraints": []}
+
+        # Use CUSTOMER_NUMBER for MV_USER_ACCESS; same value often used as CUSTOMER_ID in DIM/FCT
+        customer_number = profile.get("customer_number") or profile.get("customer_uid") or ""
+        customer_id = str(profile.get("customer_id") or customer_number)
+
+        return {
+            "client_profile": profile,
+            "user_access": self.get_user_access(str(customer_number)),
+            "kap_reports": self.get_kap_reports(customer_id),
+            "wallet_details": self.get_wallet_details(customer_id),
+            "financial_ratios": self.get_financial_ratios(customer_id),
+            "issues_constraints": self.get_issues_constraints(customer_id),
+        }
