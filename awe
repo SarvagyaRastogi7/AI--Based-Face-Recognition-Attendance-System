@@ -1,91 +1,184 @@
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>Briefing – {{ company_name }}</title>
-    <style>
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-          Arial, sans-serif;
-        background: #f9fafb;
-        margin: 0;
-        padding: 24px 32px 40px;
-        color: #111827;
-      }
+"""
+Builds briefing sections using RMDB section_data and optional web_docs.
+Each section uses the tables that make sense for that part of the summary.
+"""
 
-      .container {
-        max-width: 900px;
-        margin: 0 auto;
-        background: #ffffff;
-        border-radius: 12px;
-        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
-        padding: 28px 32px 36px;
-      }
+from __future__ import annotations
 
-      h1 {
-        margin-top: 0;
-        font-size: 24px;
-        margin-bottom: 4px;
-      }
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
-      .subtitle {
-        margin-bottom: 16px;
-        font-size: 13px;
-        color: #6b7280;
-      }
+from app.clients.azure_llm import AzureLLMClient
 
-      h2 {
-        margin-top: 18px;
-        margin-bottom: 6px;
-        font-size: 18px;
-        color: #1d4ed8;
-        border-bottom: 1px solid #e5e7eb;
-        padding-bottom: 3px;
-      }
 
-      p {
-        margin: 4px 0;
-        line-height: 1.5;
-      }
+@dataclass
+class ReportSections:
+    executive_summary: str
+    prospect_background: str
+    standard_information: str
+    engagement_opportunities: str
+    strategic_initiatives: str
+    client_overview: str
+    recent_news: str
 
-      ul {
-        margin: 4px 0 4px 20px;
-      }
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "executive_summary": self.executive_summary,
+            "prospect_background": self.prospect_background,
+            "standard_information": self.standard_information,
+            "engagement_opportunities": self.engagement_opportunities,
+            "strategic_initiatives": self.strategic_initiatives,
+            "client_overview": self.client_overview,
+            "recent_news": self.recent_news,
+        }
 
-      li {
-        margin: 2px 0;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>Client Briefing – {{ company_name }}</h1>
-      <div class="subtitle">
-        Generated briefing based on SmartInsights data{% if meeting_context %}
-        for: <strong>{{ meeting_context }}</strong>{% endif %}.
-      </div>
 
-      <h2>Executive Summary</h2>
-      {{ sections.executive_summary | safe }}
+def _format_for_llm(label: str, data: Any) -> str:
+    if data is None:
+        return f"{label}: (none)"
+    if isinstance(data, (list, tuple)):
+        if not data:
+            return f"{label}: (empty)"
+        lines = [str(item) for item in data]
+        return f"{label}:\n" + "\n".join(lines)
+    return f"{label}:\n{data}"
 
-      <h2>Background of the Prospect</h2>
-      {{ sections.prospect_background | safe }}
 
-      <h2>Standard Information from Businesses</h2>
-      {{ sections.standard_information | safe }}
+class BriefingOrchestrator:
+    """
+    Orchestrates section-wise LLM calls using RMDB section_data and web search.
+    """
 
-      <h2>Potential Areas of Engagement and Talk Points</h2>
-      {{ sections.engagement_opportunities | safe }}
+    def __init__(self) -> None:
+        self._llm = AzureLLMClient()
 
-      <h2>Strategic Initiatives and Focus Areas</h2>
-      {{ sections.strategic_initiatives | safe }}
+    def _join_web_docs(self, web_docs: List[Dict[str, Any]]) -> str:
+        if not web_docs:
+            return "(No web search results available.)"
+        lines: List[str] = []
+        for doc in web_docs:
+            line = f"- {doc.get('title', 'Untitled')} ({doc.get('date', 'unknown date')}): {doc.get('summary', '')}"
+            lines.append(line)
+        return "\n".join(lines)
 
-      <h2>Client Overview</h2>
-      {{ sections.client_overview | safe }}
+    def build_report_sections(
+        self,
+        *,
+        company_name: str,
+        meeting_context: str | None,
+        section_data: Dict[str, Any],
+        web_docs: List[Dict[str, Any]],
+    ) -> ReportSections:
+        profile = section_data.get("client_profile") or {}
+        user_access = section_data.get("user_access") or []
+        kap_reports = section_data.get("kap_reports") or []
+        wallet_details = section_data.get("wallet_details") or []
+        financial_ratios = section_data.get("financial_ratios") or []
+        issues_constraints = section_data.get("issues_constraints") or []
 
-      <h2>Recent and Relevant News</h2>
-      {{ sections.recent_news | safe }}
-    </div>
-  </body>
-</html>
+        web_text = f"WEB SEARCH SNIPPETS:\n{self._join_web_docs(web_docs)}"
 
+        # ---- Executive Summary: profile + wallet/ratios high-level + web ----
+        exec_context = (
+            f"CLIENT PROFILE (MV_DIM_LH_CUST_IB_GKAP):\n{profile}\n\n"
+            f"WALLET SUMMARY (sample):\n{_format_for_llm('wallet_details', wallet_details[:5])}\n\n"
+            f"FINANCIAL RATIOS (sample):\n{_format_for_llm('financial_ratios', financial_ratios[:10])}\n\n"
+            f"{web_text}"
+        )
+        exec_summary_prompt = (
+            f"Generate a 2–3 paragraph executive summary for a client briefing on {company_name}.\n"
+            f"Meeting context: {meeting_context or 'not specified'}.\n"
+            "Focus on overall positioning, relationship context, and key considerations for senior management."
+        )
+        executive_summary = self._llm.generate(
+            prompt=f"{exec_context}\n\nTASK:\n{exec_summary_prompt}"
+        )
+
+        # ---- Background of the Prospect: central customer table only ----
+        prospect_context = f"CLIENT PROFILE (customer details, RM, segment, group):\n{profile}"
+        prospect_prompt = (
+            "Write a concise 'Background of the Prospect' section summarizing "
+            "customer identity, segment, group, relationship manager, and key stakeholder/visibility."
+        )
+        prospect_background = self._llm.generate(
+            prompt=f"{prospect_context}\n\nTASK:\n{prospect_prompt}"
+        )
+
+        # ---- Standard Information from Businesses: user access, KAP reports, wallet ----
+        standard_context = (
+            f"USER ACCESS (roles):\n{_format_for_llm('user_access', user_access)}\n\n"
+            f"KAP REPORTS:\n{_format_for_llm('kap_reports', kap_reports)}\n\n"
+            f"WALLET DETAILS:\n{_format_for_llm('wallet_details', wallet_details)}"
+        )
+        standard_prompt = (
+            "Using the structured business information above, summarise the existing relationship, "
+            "key products/wallet, relationship vintage, and exposure profile. "
+            "Keep it factual and organized in short paragraphs or bullet points."
+        )
+        standard_information = self._llm.generate(
+            prompt=f"{standard_context}\n\nTASK:\n{standard_prompt}"
+        )
+
+        # ---- Potential Areas of Engagement: issues/constraints + segment + profile ----
+        engagement_context = (
+            f"CLIENT PROFILE (segment, group, category):\n{profile}\n\n"
+            f"ISSUES / CONSTRAINTS (from KAP):\n{_format_for_llm('issues_constraints', issues_constraints)}\n\n"
+            f"{web_text}"
+        )
+        engagement_prompt = (
+            "Based on the client profile, issues/constraints, and any recent news, "
+            "suggest potential areas of engagement and specific talk points for a relationship meeting."
+        )
+        engagement_opportunities = self._llm.generate(
+            prompt=f"{engagement_context}\n\nTASK:\n{engagement_prompt}"
+        )
+
+        # ---- Strategic Initiatives: financial ratios + issues/constraints + web ----
+        strategic_context = (
+            f"FINANCIAL RATIOS (trends PY4 to CY):\n{_format_for_llm('financial_ratios', financial_ratios)}\n\n"
+            f"ISSUES / CONSTRAINTS:\n{_format_for_llm('issues_constraints', issues_constraints)}\n\n"
+            f"{web_text}"
+        )
+        strategic_prompt = (
+            "Summarise the client's strategic initiatives and focus areas from financial trends, "
+            "reported issues/constraints, and recent news (e.g. capex, digital, ESG, M&A). "
+            "Structure as short paragraphs or bullet points."
+        )
+        strategic_initiatives = self._llm.generate(
+            prompt=f"{strategic_context}\n\nTASK:\n{strategic_prompt}"
+        )
+
+        # ---- Client Overview: profile + wallet + ratios + web ----
+        overview_context = (
+            f"CLIENT PROFILE:\n{profile}\n\n"
+            f"WALLET DETAILS:\n{_format_for_llm('wallet_details', wallet_details)}\n\n"
+            f"FINANCIAL RATIOS:\n{_format_for_llm('financial_ratios', financial_ratios)}\n\n"
+            f"{web_text}"
+        )
+        overview_prompt = (
+            "Draft a 'Client Overview' section that blends structured database information and "
+            "publicly available information. Prioritise the structured data; mention material public facts."
+        )
+        client_overview = self._llm.generate(
+            prompt=f"{overview_context}\n\nTASK:\n{overview_prompt}"
+        )
+
+        # ---- Recent and Relevant News: web only ----
+        news_prompt = (
+            "List the most recent and relevant news items about the client as bullet points. "
+            "For each item, include date (if known), a one-line summary, and source or URL if available. "
+            "If no web results are provided, say so briefly."
+        )
+        recent_news = self._llm.generate(
+            prompt=f"{web_text}\n\nTASK:\n{news_prompt}"
+        )
+
+        return ReportSections(
+            executive_summary=executive_summary,
+            prospect_background=prospect_background,
+            standard_information=standard_information,
+            engagement_opportunities=engagement_opportunities,
+            strategic_initiatives=strategic_initiatives,
+            client_overview=client_overview,
+            recent_news=recent_news,
+        )
